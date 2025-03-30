@@ -7,10 +7,85 @@
 #include <unistd.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <fcntl.h>
+#include <ctime>
 
 // Configuration settings
 #define BROADCAST_PORT 60000  // Port used for service discovery
 #define ANNOUNCE_INTERVAL 10  // Time between broadcasts (seconds)
+#define MAX_BUFFER_SIZE 1024  // Maximum size of the receive buffer
+
+/**
+ * Sets up a UDP socket to listen for incoming broadcasts on the specified port.
+ * The socket is configured to be non-blocking.
+ */
+int setup_receiver_socket() {
+    // Create a UDP socket
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        std::cerr << "Receiver socket creation failed: " << strerror(errno) << "\n";
+        return -1;
+    }
+
+    // Set the socket to non-blocking mode
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    if (flags < 0) {
+        std::cerr << "Failed to get socket flags: " << strerror(errno) << "\n";
+        close(sockfd);
+        return -1;
+    }
+    
+    if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        std::cerr << "Failed to set socket non-blocking: " << strerror(errno) << "\n";
+        close(sockfd);
+        return -1;
+    }
+
+    // Allow multiple sockets to use the same port
+    int reuseAddr = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &reuseAddr, sizeof(reuseAddr)) < 0) {
+        std::cerr << "Failed to set SO_REUSEADDR: " << strerror(errno) << "\n";
+        close(sockfd);
+        return -1;
+    }
+
+    // Bind to the broadcast port on INADDR_ANY (listen on all interfaces)
+    sockaddr_in receiverAddr = {};
+    receiverAddr.sin_family = AF_INET;
+    receiverAddr.sin_port = htons(BROADCAST_PORT);
+    receiverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(sockfd, (sockaddr*)&receiverAddr, sizeof(receiverAddr)) < 0) {
+        std::cerr << "Bind to broadcast port failed: " << strerror(errno) << "\n";
+        close(sockfd);
+        return -1;
+    }
+
+    return sockfd;
+}
+
+/**
+ * Sets up a UDP socket for sending broadcast messages.
+ * The socket is configured with the broadcast option enabled.
+ */
+int setup_broadcast_socket() {
+    // Create a UDP socket for broadcasting
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        std::cerr << "Broadcast socket creation failed: " << strerror(errno) << "\n";
+        return -1;
+    }
+
+    // Enable broadcasting on this socket
+    int broadcastEnable = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable)) < 0) {
+        std::cerr << "Setting broadcast option failed: " << strerror(errno) << "\n";
+        close(sockfd);
+        return -1;
+    }
+
+    return sockfd;
+}
 
 /**
  * Determines if a network interface can be used for broadcasting.
@@ -18,9 +93,11 @@
  */
 bool is_valid_interface(ifaddrs* ifa) {
     return (ifa->ifa_addr != nullptr && 
+            ifa->ifa_flags & IFF_UP && 
+            ifa->ifa_addr->sa_family == AF_INET &&
             ifa->ifa_broadaddr != nullptr && 
             !(ifa->ifa_flags & IFF_LOOPBACK) && 
-            (ifa->ifa_flags & IFF_BROADCAST));
+            ifa->ifa_flags & IFF_BROADCAST);
 }
 
 /**
@@ -69,29 +146,13 @@ bool get_mac_address(const std::string& interface, std::string& mac_address) {
  * Sends a UDP broadcast message to announce this service on the network.
  * The message includes the local IP and MAC address for identification.
  */
-bool send_broadcast(const std::string& broadcast_ip, const std::string& local_ip, const std::string& mac_address) {
-    // Create a UDP socket for broadcasting
-    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sockfd < 0) {
-        std::cerr << "Socket creation failed: " << strerror(errno) << "\n";
-        return false;
-    }
-
-    // Enable broadcasting on this socket
-    int broadcastEnable = 1;
-    if (setsockopt(sockfd, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable)) < 0) {
-        std::cerr << "Setting broadcast option failed: " << strerror(errno) << "\n";
-        close(sockfd);
-        return false;
-    }
-
+bool send_broadcast(int sockfd, const std::string& broadcast_ip, const std::string& local_ip, const std::string& mac_address) {
     // Set up the broadcast address structure
     sockaddr_in broadcastAddr = {};
     broadcastAddr.sin_family = AF_INET;
     broadcastAddr.sin_port = htons(BROADCAST_PORT);
     if (inet_pton(AF_INET, broadcast_ip.c_str(), &broadcastAddr.sin_addr) <= 0) {
         std::cerr << "Invalid broadcast address: " << broadcast_ip << "\n";
-        close(sockfd);
         return false;
     }
 
@@ -103,11 +164,8 @@ bool send_broadcast(const std::string& broadcast_ip, const std::string& local_ip
     if (sendto(sockfd, message.c_str(), message.size(), 0, 
               (sockaddr*)&broadcastAddr, sizeof(broadcastAddr)) < 0) {
         std::cerr << "Broadcast send failed: " << strerror(errno) << "\n";
-        close(sockfd);
         return false;
     }
-
-    close(sockfd);
     return true;
 }
 
@@ -115,7 +173,7 @@ bool send_broadcast(const std::string& broadcast_ip, const std::string& local_ip
  * Main discovery function that announces our service on all network interfaces.
  * Iterates through network interfaces and broadcasts on each valid one.
  */
-void broadcast_service_presence() {
+void broadcast_service_presence(int broadcast_sockfd) {
     // Get a list of all network interfaces on this device
     ifaddrs* ifaddr = nullptr;
     if (getifaddrs(&ifaddr) == -1) {
@@ -126,7 +184,7 @@ void broadcast_service_presence() {
     // Check each interface
     for (ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
         // Skip interfaces that aren't suitable for broadcasting
-        if (!is_valid_interface(ifa)) {
+        if (!is_valid_interface(ifa)) {                                                     // TODO: Filter out used subnets
             continue;
         }
 
@@ -145,8 +203,15 @@ void broadcast_service_presence() {
         }
             
         // Announce our presence on this interface
-        if (!send_broadcast(broadcast_ip, local_ip, mac_address)) {
+        if (!send_broadcast(broadcast_sockfd,broadcast_ip, local_ip, mac_address)) {
             std::cerr << "Failed to send broadcast on interface " << ifa->ifa_name << "\n";
+        } else {
+            // Log successful broadcast
+            std::time_t now = std::time(nullptr);
+            char time_str[9];
+            std::strftime(time_str, sizeof(time_str), "%H:%M:%S", std::localtime(&now));
+            std::cout << time_str << ": Broadcast sent from " << ifa->ifa_name << " (" << local_ip 
+                      << ") to " << broadcast_ip << " (MAC: " << mac_address << ")\n";
         }
     }
     
@@ -155,12 +220,99 @@ void broadcast_service_presence() {
 }
 
 /**
- * Main program loop that periodically announces our service presence.
+ * Receives broadcast messages from other services.
+ * Simply logs the received message to the console.
+ */
+void receive_broadcasts(int sockfd) {
+    char buffer[MAX_BUFFER_SIZE];
+    sockaddr_in senderAddr = {};
+    socklen_t senderLen = sizeof(senderAddr);
+
+    // Check if there's data to read without blocking
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(sockfd, &readfds);
+    
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 0;  // Non-blocking, just check if there's data
+    
+    int ready = select(sockfd + 1, &readfds, NULL, NULL, &timeout);
+    if (ready < 0) {
+        std::cerr << "Select failed: " << strerror(errno) << "\n";
+        return;
+    }
+    
+    // Nothing to read, return immediately
+    if (ready == 0) {
+        return;
+    }
+
+    // Read messages while there are any available
+    while (true) {
+        int bytesReceived = recvfrom(sockfd, buffer, MAX_BUFFER_SIZE - 1, 0, 
+                                     (sockaddr*)&senderAddr, &senderLen);
+        if (bytesReceived < 0) {
+            // EAGAIN or EWOULDBLOCK indicate no more data to read
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+            std::cerr << "Error receiving broadcast: " << strerror(errno) << "\n";
+            break;
+        }
+        
+        // Null-terminate the received data to treat it as a string
+        buffer[bytesReceived] = '\0';
+        
+        // Convert sender IP address to string
+        char senderIP[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &(senderAddr.sin_addr), senderIP, INET_ADDRSTRLEN);
+        
+        // Simply log that we received a message
+        std::cout << "Received broadcast from " << senderIP << ": " << buffer << std::endl;
+    }
+}
+
+/**
+ * Main program loop that periodically announces our service presence and
+ * continuously listens for broadcasts from other services.
  */
 int main() {
-    while (true) {
-        broadcast_service_presence();
-        sleep(ANNOUNCE_INTERVAL);
+    // Set up the receiver socket
+    const int receiver_sockfd = setup_receiver_socket();
+    if (receiver_sockfd < 0) {
+        std::cerr << "Failed to set up receiver socket, exiting\n";
+        return 1;
     }
+    
+    // Set up the broadcast socket
+    const int broadcast_sockfd = setup_broadcast_socket();
+    if (broadcast_sockfd < 0) {
+        std::cerr << "Failed to set up broadcast socket, exiting\n";
+        close(receiver_sockfd);
+        return 1;
+    }
+
+    time_t last_broadcast_time = 0;
+    
+    while (true) {
+        time_t current_time = time(NULL);
+        
+        // Check if it's time to broadcast our presence
+        if (current_time - last_broadcast_time >= ANNOUNCE_INTERVAL) {
+            broadcast_service_presence(broadcast_sockfd);
+            last_broadcast_time = current_time;
+        }
+        
+        // Check for incoming broadcasts
+        receive_broadcasts(receiver_sockfd);
+        
+        // Sleep for a short time to avoid hogging CPU
+        usleep(100000);  // 100ms
+    }
+    
+    // Clean up sockets (this code will never be reached in this example)
+    close(receiver_sockfd);
+    close(broadcast_sockfd);
     return 0;
 }
