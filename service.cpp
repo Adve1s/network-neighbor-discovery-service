@@ -3,6 +3,8 @@
 #include <sstream>
 #include <cstring>
 #include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -12,12 +14,19 @@
 #include <ctime>
 #include <unordered_set>
 #include <unordered_map>
+#include <csignal>
 
 // Configuration settings
-#define BROADCAST_PORT 60000  // Port used for service discovery
-#define ANNOUNCE_INTERVAL 10  // Time between broadcasts (seconds)
-#define CLEANUP_INTERVAL 5    // Time between neighbor removals
-#define MAX_BUFFER_SIZE 1024  // Maximum size of the receive buffer
+#define BROADCAST_PORT 60000   // Port used for service discovery
+#define ANNOUNCE_INTERVAL 10   // Time between broadcasts (seconds)
+#define CLEANUP_INTERVAL 5     // Time between neighbor removals
+#define MAX_BUFFER_SIZE 1024   // Maximum size of the receive buffer
+#define SOCKET_PATH "/tmp/neighbor_service.sock" // Unix socket for CLI communication
+#define ERROR_THRESHOLD 3      // Number of consecutive errors before socket recreation
+#define MAX_SOCKET_RECREATE_ATTEMPTS 5   // Number of attemts to recreate socket
+#define SOCKET_RECREATE_BACKOFF_MS 1000  // Start with 1 second
+
+volatile sig_atomic_t shutdown_requested = 0;    // Flag to indicate shutdown is requested
 
 // Neighbor information
 struct Neighbor {
@@ -27,10 +36,16 @@ struct Neighbor {
 };
 
 // Data structures used for neighbor communication
-std::unordered_set<std::string> used_broadcasts;        // Used to avoid sending double messages
+std::unordered_set<std::string> my_subnets;        // Used to avoid sending double messages
 std::unordered_set<std::string> my_local_ips;           // Used to ignore own incoming messages
 std::unordered_map<std::string, Neighbor> neighbors;    // Key: MAC address, Value: Neighbor struct
 std::unordered_map<std::string, int> ip_usage_count;    // Track how many devices use each IP
+int udp_error_count = 0;  // Counter for UDP socket errors
+int cli_error_count = 0;  // Counter for CLI socket errors
+
+//------------------------------------------------------------------------------
+// Utility and Helper Functions
+//------------------------------------------------------------------------------
 
 /**
  * Returns a formatted string of the current time (HH:MM:SS)
@@ -76,84 +91,73 @@ void log_message(LogLevel level, const std::string& message) {
 }
 
 /**
- * Sets up a UDP socket to listen for incoming broadcasts on the specified port.
- * The socket is configured to be non-blocking.
+ * Sets a socket to non-blocking mode.
+ * Uses fcntl to modify the socket's flags without affecting other settings.
  */
-int setup_receiver_socket() {
-    // Create a UDP socket
-    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sockfd < 0) {
-        log_message(ERROR, "Receiver socket creation failed: " + std::string(strerror(errno)));
-        return -1;
-    }
-
-    // Set the socket to non-blocking mode
+bool set_socket_nonblocking(int sockfd, const std::string& socket_name) {
+    // Get current flags
     int flags = fcntl(sockfd, F_GETFL, 0);
     if (flags < 0) {
-        log_message(ERROR, "Failed to get socket flags: " + std::string(strerror(errno)));
-        close(sockfd);
-        return -1;
+        log_message(ERROR, "Failed to get " + socket_name + " socket flags: " + std::string(strerror(errno)));
+        return false;
     }
     
+    // Set non-blocking flag without affecting other flags
     if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
-        log_message(ERROR, "Failed to set socket non-blocking: " + std::string(strerror(errno)));
-        close(sockfd);
-        return -1;
+        log_message(ERROR, "Failed to set " + socket_name + " socket non-blocking: " + std::string(strerror(errno)));
+        return false;
     }
-
-    // Allow multiple sockets to use the same port
-    int reuseAddr = 1;
-    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &reuseAddr, sizeof(reuseAddr)) < 0) {
-        log_message(ERROR, "Failed to set SO_REUSEADDR: " + std::string(strerror(errno)));
-        close(sockfd);
-        return -1;
-    }
-
-    // Add SO_REUSEPORT option
-    int reusePort = 1;
-    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &reusePort, sizeof(reusePort)) < 0) {
-        log_message(ERROR, "Failed to set SO_REUSEPORT: " + std::string(strerror(errno)));
-        // We can continue even if this fails, as SO_REUSEADDR is already set
-        log_message(WARN, "Continuing without SO_REUSEPORT");
-    }
-
-    // Bind to the broadcast port on INADDR_ANY (listen on all interfaces)
-    sockaddr_in receiverAddr = {};
-    receiverAddr.sin_family = AF_INET;
-    receiverAddr.sin_port = htons(BROADCAST_PORT);
-    receiverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-    if (bind(sockfd, (sockaddr*)&receiverAddr, sizeof(receiverAddr)) < 0) {
-        log_message(ERROR, "Bind to broadcast port failed: " + std::string(strerror(errno)));
-        close(sockfd);
-        return -1;
-    }
-
-    return sockfd;
+    
+    return true;
 }
 
 /**
- * Sets up a UDP socket for sending broadcast messages.
- * The socket is configured with the broadcast option enabled.
+ * Validates a MAC address string format.
+ * Checks that the string matches the standard colon-separated MAC address format.
  */
-int setup_broadcast_socket() {
-    // Create a UDP socket for broadcasting
-    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sockfd < 0) {
-        log_message(ERROR, "Broadcast socket creation failed: " + std::string(strerror(errno)));
-        return -1;
+bool validate_mac_address(const std::string& mac) {
+    // Check for correct length (17 characters for XX:XX:XX:XX:XX:XX)
+    if (mac.length() != 17) return false;
+    
+    // Check that colon separators are in the correct positions
+    if (mac[2] != ':' || mac[5] != ':' || mac[8] != ':' || 
+        mac[11] != ':' || mac[14] != ':') {
+        return false;
     }
-
-    // Enable broadcasting on this socket
-    int broadcastEnable = 1;
-    if (setsockopt(sockfd, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable)) < 0) {
-        log_message(ERROR, "Setting broadcast option failed: " + std::string(strerror(errno)));
-        close(sockfd);
-        return -1;
+    
+    // Verify all other characters are valid hexadecimal digits
+    for (int i = 0; i < 17; i++) {
+        // Skip the colon positions
+        if (i == 2 || i == 5 || i == 8 || i == 11 || i == 14) continue;
+        
+        // Check that character is a valid hex digit
+        if (!isxdigit(mac[i])) return false;
     }
-
-    return sockfd;
+    
+    return true;
 }
+
+/**
+ * Calculates the subnet address from an IP address and netmask.
+ * Performs a bitwise AND operation between the IP and netmask.
+ */
+std::string calculate_subnet(const sockaddr_in* ip_addr, const sockaddr_in* netmask) {
+    // Perform the bitwise AND between IP and netmask
+    in_addr subnet_addr;
+    subnet_addr.s_addr = ip_addr->sin_addr.s_addr & netmask->sin_addr.s_addr;
+    
+    // Convert to string format
+    char subnet_str[INET_ADDRSTRLEN] = {};
+    if (!inet_ntop(AF_INET, &subnet_addr, subnet_str, INET_ADDRSTRLEN)) {
+        return "";
+    }
+    
+    return subnet_str;
+}
+
+//------------------------------------------------------------------------------
+// Network Interface Management
+//------------------------------------------------------------------------------
 
 /**
  * Determines if a network interface can be used for broadcasting.
@@ -169,13 +173,13 @@ bool is_valid_interface(const ifaddrs* ifa) {
 }
 
 /**
- * Gets the IP addresses associated with a network interface.
- * Converts the binary address formats to human-readable strings.
+ * Gets the IP addresses and subnet associated with a network interface.
  */
-bool extract_ip_addresses(const ifaddrs* ifa, std::string& local_ip, std::string& broadcast_ip) {
+bool extract_ip_addresses(const ifaddrs* ifa, std::string& local_ip, std::string& broadcast_ip, std::string& subnet) {
     // Convert to IPv4 address format
     const auto* addr = reinterpret_cast<const sockaddr_in*>(ifa->ifa_addr);
     const auto* broadcast = reinterpret_cast<const sockaddr_in*>(ifa->ifa_broadaddr);
+    const auto* netmask = reinterpret_cast<const sockaddr_in*>(ifa->ifa_netmask);
     
     // Prepare buffers for the string versions of the addresses
     char local_ip_buf[INET_ADDRSTRLEN] = {};
@@ -184,6 +188,12 @@ bool extract_ip_addresses(const ifaddrs* ifa, std::string& local_ip, std::string
     // Convert the addresses and check for errors
     if (!inet_ntop(AF_INET, &addr->sin_addr, local_ip_buf, INET_ADDRSTRLEN) ||
         !inet_ntop(AF_INET, &broadcast->sin_addr, broadcast_ip_buf, INET_ADDRSTRLEN)) {
+        return false;
+    }
+    
+    // Calculate subnet from IP and netmask
+    subnet = calculate_subnet(addr, netmask);
+    if (subnet.empty()) {
         return false;
     }
     
@@ -221,12 +231,13 @@ void log_interfaces() {
         
         for (ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
             if (is_valid_interface(ifa)) {
-                std::string local_ip, broadcast_ip;
-                if (extract_ip_addresses(ifa, local_ip, broadcast_ip)) {
+                std::string local_ip, broadcast_ip, subnet;
+                if (extract_ip_addresses(ifa, local_ip, broadcast_ip, subnet)) {
                     valid_interface_count++;
                     log_message(INFO, "  Interface: " + std::string(ifa->ifa_name) + 
                                ", IP: " + local_ip + 
-                               ", Broadcast: " + broadcast_ip);
+                               ", Broadcast: " + broadcast_ip + 
+                               ", Subnet: " + subnet);
                 }
             }
         }
@@ -238,93 +249,190 @@ void log_interfaces() {
     }
 }
 
+//------------------------------------------------------------------------------
+// Socket and Communication Setup
+//------------------------------------------------------------------------------
+
 /**
- * Sends a UDP broadcast message to announce this service on the network.
- * The message includes the local IP and MAC address for identification.
- */
-bool send_broadcast(const int sockfd, const std::string& broadcast_ip, const std::string& local_ip, const std::string& mac_address) {
-    // Set up the broadcast address structure
-    sockaddr_in broadcastAddr = {};
-    broadcastAddr.sin_family = AF_INET;
-    broadcastAddr.sin_port = htons(BROADCAST_PORT);
-    if (inet_pton(AF_INET, broadcast_ip.c_str(), &broadcastAddr.sin_addr) <= 0) {
-        log_message(ERROR, "Invalid broadcast address: " + broadcast_ip);
-        return false;
+* Sets up a UDP socket to listen for incoming messages and send broadcasts.
+* The socket is configured to be non-blocking with broadcast capability.
+*/
+int setup_udp_socket(int port) {
+    // Create a UDP socket
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        log_message(ERROR, "Socket creation failed for port " + std::to_string(port) + ": " + std::string(strerror(errno)));
+        return -1;
     }
 
-    // Format the message with identifying information
-    // The receiving function will add a timestamp when received
-    std::string message = "NEIGHBOR " + local_ip + " " + mac_address;
-
-    // Send the broadcast packet
-    if (sendto(sockfd, message.c_str(), message.size(), 0, 
-              (sockaddr*)&broadcastAddr, sizeof(broadcastAddr)) < 0) {
-        log_message(ERROR, "Broadcast send failed: " + std::string(strerror(errno)));
-        return false;
+    // Set the socket to non-blocking mode
+    if (!set_socket_nonblocking(sockfd, "UDP")) {
+        close(sockfd);
+        return -1;
     }
-    return true;
+
+    // Allow multiple sockets to use the same port
+    int reuse_addr = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr)) < 0) {
+        log_message(ERROR, "Failed to set SO_REUSEADDR: " + std::string(strerror(errno)));
+        close(sockfd);
+        return -1;
+    }
+
+    // Add SO_REUSEPORT option
+    int reuse_port = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &reuse_port, sizeof(reuse_port)) < 0) {
+        log_message(ERROR, "Failed to set SO_REUSEPORT: " + std::string(strerror(errno)));
+        // We can continue even if this fails, as SO_REUSEADDR is already set
+        log_message(WARN, "Continuing without SO_REUSEPORT");
+    }
+
+    // Enable broadcast
+    int broadcast_enable = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_BROADCAST, &broadcast_enable, sizeof(broadcast_enable)) < 0) {
+        log_message(ERROR, "Setting broadcast option failed: " + std::string(strerror(errno)));
+        close(sockfd);
+        return -1;
+    }
+
+    // Bind to the specified port on INADDR_ANY (listen on all interfaces)
+    sockaddr_in sock_addr = {};
+    sock_addr.sin_family = AF_INET;
+    sock_addr.sin_port = htons(port);
+    sock_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(sockfd, (sockaddr*)&sock_addr, sizeof(sock_addr)) < 0) {
+        log_message(ERROR, "Bind to port " + std::to_string(port) + " failed: " + std::string(strerror(errno)));
+        close(sockfd);
+        return -1;
+    }
+
+    log_message(INFO, "UDP socket ready on port " + std::to_string(port) + " (broadcast enabled)");
+    return sockfd;
 }
 
 /**
- * Main discovery function that announces our service on all network interfaces.
- * Iterates through network interfaces and broadcasts on each valid one.
+ * Sets up a Unix domain socket for CLI communication.
+ * The socket is configured to be non-blocking and listening for connections.
  */
-void broadcast_service_presence(const int broadcast_sockfd) {
-    // Get a list of all network interfaces on this device
-    ifaddrs* ifaddr = nullptr;
-    if (getifaddrs(&ifaddr) == -1) {
-        log_message(ERROR, "Failed to get network interfaces: " + std::string(strerror(errno)));
-        return;
+int setup_cli_socket() {
+    // Remove any existing socket file
+    unlink(SOCKET_PATH);
+    
+    // Create a Unix domain socket
+    int sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        log_message(ERROR, "CLI socket creation failed: " + std::string(strerror(errno)));
+        return -1;
     }
     
-    // Check each interface
-    for (ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
-        // Skip interfaces that aren't suitable for broadcasting
-        if (!is_valid_interface(ifa)) {
-            continue;
-        }
+    // Set up the server address
+    sockaddr_un server_addr = {};
+    server_addr.sun_family = AF_UNIX;
+    strncpy(server_addr.sun_path, SOCKET_PATH, sizeof(server_addr.sun_path) - 1);
+    server_addr.sun_path[sizeof(server_addr.sun_path) - 1] = '\0';
+    
+    // Bind the socket to the path
+    if (bind(sockfd, (sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        log_message(ERROR, "CLI socket bind failed: " + std::string(strerror(errno)));
+        close(sockfd);
+        return -1;
+    }
+    
+    // Set the socket to non-blocking mode
+    if (!set_socket_nonblocking(sockfd, "CLI")) {
+        close(sockfd);
+        return -1;
+    }
+    
+    // Start listening for connections
+    if (listen(sockfd, 5) < 0) {
+        log_message(ERROR, "CLI socket listen failed: " + std::string(strerror(errno)));
+        close(sockfd);
+        return -1;
+    }
+     
+    // Set permissions to allow any user to connect to the socket
+    chmod(SOCKET_PATH, 0600);
+    
+    log_message(INFO, "CLI communication socket initialized at " + std::string(SOCKET_PATH));
+    return sockfd;
+}
 
-        // Get the IP addresses for this interface
-        std::string local_ip, broadcast_ip;
-        if (!extract_ip_addresses(ifa, local_ip, broadcast_ip)) {
-            log_message(ERROR, "Failed to extract IP addresses for interface " + std::string(ifa->ifa_name));
-            continue;
-        }
-
-        my_local_ips.insert(local_ip);
-            
-        // Get the MAC address for identification
-        std::string mac_address;
-        if (!get_mac_address(ifa->ifa_name, mac_address)) {
-            log_message(ERROR, "Failed to get MAC address for interface " + std::string(ifa->ifa_name));
-            continue;
-        }
+/**
+ * Attempts to recreate a failed socket.
+ */
+bool recreate_socket(int socket_type, int& current_sockfd) {
+    int try_num = 0;
+    if (socket_type == 0) {  // UDP socket
+        log_message(WARN, "UDP socket failed. Attempting to recreate...");
+    } else {  // CLI socket
+        log_message(WARN, "CLI socket failed. Attempting to recreate...");
+    }
+    while(try_num <MAX_SOCKET_RECREATE_ATTEMPTS){
+        // Sleep for the backoff duration
+        usleep(try_num*SOCKET_RECREATE_BACKOFF_MS*1000);
         
-        // Skip if we've already broadcast to this network in this cycle
-        if (used_broadcasts.find(broadcast_ip) != used_broadcasts.end()) {
-            continue;
-        }
-        used_broadcasts.insert(broadcast_ip);  // Mark this broadcast address as used
+        // Count number of tries
+        try_num++;
 
-        // Announce our presence on this interface
-        if (!send_broadcast(broadcast_sockfd,broadcast_ip, local_ip, mac_address)) {
-            log_message(ERROR, "Failed to send broadcast on interface " + std::string(ifa->ifa_name));
+        // Close the existing socket if it's valid
+        if (current_sockfd >= 0) {
+            close(current_sockfd);
         }
+                
+        // Attempt to recreate the appropriate socket
+        if (socket_type == 0) {  // UDP socket
+            log_message(INFO, "Recreating UDP socket...");
+            current_sockfd = setup_udp_socket(BROADCAST_PORT);
+            if (current_sockfd >= 0) {
+                udp_error_count = 0;  // Reset the error counter
+                return true;
+            }
+        } else {  // CLI socket
+            log_message(INFO, "Recreating CLI socket...");
+            current_sockfd = setup_cli_socket();
+            if (current_sockfd >= 0) {
+                cli_error_count = 0;  // Reset the error counter
+                return true;
+            }
+        }
+        log_message(ERROR, "Recreation failed, attempts left: " + std::to_string(MAX_SOCKET_RECREATE_ATTEMPTS-try_num));
     }
-    
-    // Free the memory allocated by getifaddrs
-    freeifaddrs(ifaddr);
+    log_message(ERROR, "CRITICAL: Failed to recreate socket after multiple attempts. Service cannot function properly and is shutting down.");
+    return false;
+}
+
+//------------------------------------------------------------------------------
+// Neighbor Management
+//------------------------------------------------------------------------------
+
+/**
+ * Checks for IP-related issues like conflicts and mismatches
+ */
+void check_ip_issues(const std::string& message_ip, const std::string& sender_ip) {
+    // Check for IP conflict (multiple devices using same IP)
+    if (ip_usage_count[message_ip] > 1) {
+        log_message(WARN, "IP conflict detected: " + message_ip + " is used by " + 
+                    std::to_string(ip_usage_count[message_ip]) + " devices");
+    }
+
+    // Compare sender IP with message IP
+    if (message_ip != sender_ip) {
+        log_message(WARN, "IP mismatch - Message claims " + message_ip 
+            + " but packet came from " + sender_ip);
+    }
 }
 
 /**
  * Adds a new neighbor or updates an existing one
  */
-void add_or_update_neighbor(const std::string& message_ip, const std::string& message_mac) {
+void add_or_update_neighbor(const std::string& message_ip, const std::string& message_mac , const std::string& sender_ip) {
     time_t current_time = time(NULL);
-    
+
     // Check if we already have a neighbor with this MAC
     auto it = neighbors.find(message_mac);
-    
+
     // New neighbor (MAC not found)
     if (it == neighbors.end()) {
         // Add to map
@@ -335,12 +443,8 @@ void add_or_update_neighbor(const std::string& message_ip, const std::string& me
         // Increment IP usage count
         ip_usage_count[message_ip]++;
 
-        // Check for IP conflict (multiple devices using same IP)
-        // This could indicate IP spoofing or network misconfiguration
-        if (ip_usage_count[message_ip] > 1) {
-            log_message(WARN, "IP conflict detected: " + message_ip + " is used by " + 
-                        std::to_string(ip_usage_count[message_ip]) + " devices");
-        }
+        // Check for ip issues
+        check_ip_issues(message_ip, sender_ip);
 
     }else{    
         // Check if IP changed
@@ -357,11 +461,8 @@ void add_or_update_neighbor(const std::string& message_ip, const std::string& me
             // Increment new IP usage count
             ip_usage_count[message_ip]++;
             
-            // Check for IP conflict with new IP
-            if (ip_usage_count[message_ip] > 1) {
-                log_message(WARN, "IP conflict detected: " + message_ip + " is used by " + 
-                            std::to_string(ip_usage_count[message_ip]) + " devices");
-            }
+            // Check for ip issues
+            check_ip_issues(message_ip, sender_ip);
         }
         
         // Always update timestamp
@@ -396,42 +497,42 @@ void remove_inactive_neighbors() {
 }
 
 /**
- * Validates a MAC address string format.
- * Checks that the string matches the standard colon-separated MAC address format.
+ * Formats the current list of active neighbors into a human-readable string.
+ * This formatted information is sent to CLI clients upon request.
  */
-bool validate_mac_address(const std::string& mac) {
-    // Check for correct length (17 characters for XX:XX:XX:XX:XX:XX)
-    if (mac.length() != 17) return false;
+std::string format_neighbor_list() {
+    std::string result;
     
-    // Check that colon separators are in the correct positions
-    if (mac[2] != ':' || mac[5] != ':' || mac[8] != ':' || 
-        mac[11] != ':' || mac[14] != ':') {
-        return false;
-    }
-    
-    // Verify all other characters are valid hexadecimal digits
-    for (int i = 0; i < 17; i++) {
-        // Skip the colon positions
-        if (i == 2 || i == 5 || i == 8 || i == 11 || i == 14) continue;
+    if (neighbors.empty()) {
+        result = "No active neighbors found.\n";
+    } else {
+        result = "Active neighbors:\n";
+        result += "----------------\n";
         
-        // Check that character is a valid hex digit
-        if (!isxdigit(mac[i])) return false;
+        for (const auto& pair : neighbors) {
+            const Neighbor& neighbor = pair.second;
+            result += "IP: " + neighbor.ip_address + " | MAC: " + neighbor.mac_address + "\n";
+        }
     }
     
-    return true;
+    return result;
 }
+
+//------------------------------------------------------------------------------
+// Message Processing
+//------------------------------------------------------------------------------
 
 /**
  * Processes received broadcast messages.
- * Validates format, message type, and checks sender IP against message IP.
+ * Handles different message types: NEIGHBOR announcements and GET_NEIGHBORS requests.
  */
 bool process_message(const std::string& sender_ip, const std::string& message) {
     // Parse the message into its component parts
     std::istringstream iss(message);
-    std::string message_type, message_ip, message_mac;
+    std::string message_type, message_ip, message_mac, message_subnet;
     
     // Extract the three expected parts
-    if (!(iss >> message_type >> message_ip >> message_mac)) {
+    if (!(iss >> message_type >> message_ip >> message_mac >> message_subnet)) {
         log_message(ERROR, "Invalid message format: " + message);
         return false;
     }
@@ -442,8 +543,14 @@ bool process_message(const std::string& sender_ip, const std::string& message) {
         return false;
     }
 
-    // Validate IP address format
-    struct sockaddr_in sa;
+    // Check if we share a subnet with this neighbor
+    if (my_subnets.find(message_subnet) == my_subnets.end()) {
+        log_message(ERROR, "Ignoring message from different subnet: " + message_subnet);
+        return false;
+    }
+
+    // Validate IP address and subnet format
+    sockaddr_in sa;
     if (inet_pton(AF_INET, message_ip.c_str(), &(sa.sin_addr)) != 1) {
         log_message(ERROR, "Invalid IP address format: " + message_ip);
         return false;
@@ -455,37 +562,31 @@ bool process_message(const std::string& sender_ip, const std::string& message) {
         return false;
     }
 
-    // Compare sender IP with message IP
-    if (message_ip != sender_ip) {
-        log_message(WARN, "IP mismatch - Message claims " + message_ip 
-            + " but packet came from " + sender_ip);
-    }
-
     // Skip adding ourselves as a neighbor if the message IP is one of our own
     if (my_local_ips.find(message_ip) != my_local_ips.end()) {
         return true;
     }
 
     // Pass validated neighbor information for tracking
-    add_or_update_neighbor(message_ip, message_mac);
+    add_or_update_neighbor(message_ip, message_mac, sender_ip);
     return true;
 }
 
 /**
- * Receives broadcast messages from other services.
- * Simply logs the received message to the console.
+ * Receives and processes messages on the given socket.
+ * Handles both neighbor broadcasts and CLI requests.
  */
-void receive_broadcasts(int sockfd) {
+void receive_messages(int& sockfd) {
     char buffer[MAX_BUFFER_SIZE];
-    sockaddr_in senderAddr = {};
-    socklen_t senderLen = sizeof(senderAddr);
+    sockaddr_in sender_addr = {};
+    socklen_t sender_len = sizeof(sender_addr);
 
     // Check if there's data to read without blocking
     fd_set readfds;
     FD_ZERO(&readfds);
     FD_SET(sockfd, &readfds);
     
-    struct timeval timeout;
+    timeval timeout;
     timeout.tv_sec = 0;
     timeout.tv_usec = 0;  // Non-blocking, just check if there's data
     
@@ -502,53 +603,301 @@ void receive_broadcasts(int sockfd) {
 
     // Read messages while there are any available
     while (true) {
-        int bytesReceived = recvfrom(sockfd, buffer, MAX_BUFFER_SIZE - 1, 0, 
-                                     (sockaddr*)&senderAddr, &senderLen);
-        if (bytesReceived < 0) {
+        int bytes_received = recvfrom(sockfd, buffer, MAX_BUFFER_SIZE - 1, 0, 
+                                     (sockaddr*)&sender_addr, &sender_len);
+        if (bytes_received < 0) {
             // EAGAIN or EWOULDBLOCK indicate no more data to read
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
             }
-            log_message(ERROR, "While receiving broadcast: " + std::string(strerror(errno)));
+            log_message(ERROR, "While receiving message: " + std::string(strerror(errno)));
             break;
         }
         
         // Null-terminate the received data to treat it as a string
-        buffer[bytesReceived] = '\0';
+        buffer[bytes_received] = '\0';
         
         // Convert sender IP address to string
-        char senderIP[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &(senderAddr.sin_addr), senderIP, INET_ADDRSTRLEN);
+        char sender_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &(sender_addr.sin_addr), sender_ip, INET_ADDRSTRLEN);
 
-        if (!process_message(senderIP,buffer)) {
-            log_message(ERROR, "Failed to process message : " + std::string(buffer));
+        if (!process_message(sender_ip,buffer)) {
+            log_message(ERROR, "Failed to process message: " + std::string(buffer));
             continue;
         }
     }
 }
 
 /**
+ * Sends a UDP broadcast message to announce this service on the network.
+ * The message includes the local IP and MAC address for identification.
+ */
+bool send_broadcast(const int sockfd, const std::string& broadcast_ip, const std::string& local_ip, const std::string& mac_address, const std::string& subnet) {
+    // Set up the broadcast address structure
+    sockaddr_in broadcast_addr = {};
+    broadcast_addr.sin_family = AF_INET;
+    broadcast_addr.sin_port = htons(BROADCAST_PORT);
+    if (inet_pton(AF_INET, broadcast_ip.c_str(), &broadcast_addr.sin_addr) <= 0) {
+        log_message(ERROR, "Invalid broadcast address: " + broadcast_ip);
+        return false;
+    }
+
+    // Format the message with identifying information
+    // The receiving function will add a timestamp when received
+    std::string message = "NEIGHBOR " + local_ip + " " + mac_address+ " " + subnet;
+
+    // Send the broadcast packet
+    if (sendto(sockfd, message.c_str(), message.size(), 0, 
+              (sockaddr*)&broadcast_addr, sizeof(broadcast_addr)) < 0) {
+        log_message(ERROR, "Broadcast send failed: " + std::string(strerror(errno)));
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Main discovery function that announces our service on all network interfaces.
+ * Iterates through network interfaces and broadcasts on each valid one.
+ */
+void broadcast_service_presence(int& broadcast_sockfd) {
+    // Get a list of all network interfaces on this device
+    ifaddrs* ifaddr = nullptr;
+    if (getifaddrs(&ifaddr) == -1) {
+        log_message(ERROR, "Failed to get network interfaces: " + std::string(strerror(errno)));
+        return;
+    }
+    
+    // Check each interface
+    for (ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+        // Skip interfaces that aren't suitable for broadcasting
+        if (!is_valid_interface(ifa)) {
+            continue;
+        }
+
+        // Get the IP addresses for this interface
+        std::string local_ip, broadcast_ip, subnet;
+        if (!extract_ip_addresses(ifa, local_ip, broadcast_ip,subnet)) {
+            log_message(ERROR, "Failed to extract IP addresses for interface " + std::string(ifa->ifa_name));
+            continue;
+        }
+        
+        // Track local IPs
+        my_local_ips.insert(local_ip);
+            
+        // Get the MAC address for identification
+        std::string mac_address;
+        if (!get_mac_address(ifa->ifa_name, mac_address)) {
+            log_message(ERROR, "Failed to get MAC address for interface " + std::string(ifa->ifa_name));
+            continue;
+        }
+        
+        // Skip if we've already broadcast to this subnet in this cycle
+        if (my_subnets.find(subnet) != my_subnets.end()) {
+            continue;
+        }
+        my_subnets.insert(subnet);  // Mark this subnet address as used
+
+        // Announce our presence on this interface
+        if (!send_broadcast(broadcast_sockfd,broadcast_ip, local_ip, mac_address, subnet)) {
+            log_message(ERROR, "Failed to send broadcast on interface " + std::string(ifa->ifa_name));
+            udp_error_count++;
+            if (udp_error_count >= 2) { 
+                if(!recreate_socket(0, broadcast_sockfd)){ // 0 indicates UDP socket
+                    shutdown_requested = 1;
+                };
+            }
+        }
+    }
+    
+    // Free the memory allocated by getifaddrs
+    freeifaddrs(ifaddr);
+}
+
+//------------------------------------------------------------------------------
+// CLI Client Handling
+//------------------------------------------------------------------------------
+
+/**
+ * Handles a connection from a CLI client.
+ * Reads the command, validates it, and sends the neighbor list if the command is valid.
+ */
+void handle_cli_client(int client_fd) {
+    // Set the socket to non-blocking mode
+    if (!set_socket_nonblocking(client_fd, "client")) {
+        close(client_fd);
+        return;
+    }
+    
+    // Buffer for receiving the command
+    char buffer[MAX_BUFFER_SIZE];
+    
+    // Read the command from the client
+    int bytes_read = read(client_fd, buffer, MAX_BUFFER_SIZE - 1);
+    
+    // Check if we successfully read anything
+    if (bytes_read <= 0) {
+        if (bytes_read < 0) {
+            log_message(ERROR, "Error reading from client: " + std::string(strerror(errno)));
+        }
+        return; // No data or error, just close the connection
+    }
+    
+    // Null-terminate the received data to treat it as a string
+    buffer[bytes_read] = '\0';
+    
+    // Check if the command is GET_NEIGHBORS (uppercase for consistency with your style)
+    if (std::string(buffer) != "GET_NEIGHBORS") {
+        log_message(ERROR, "Received invalid command: " + std::string(buffer));
+        return; // Invalid command, just close the connection
+    }
+    
+    // Log the valid command received
+    log_message(INFO, "CLI client requested neighbor list");
+
+    // Format the neighbor list
+    std::string response = format_neighbor_list();
+    
+    // Send the response to the client
+    size_t total_sent = 0;
+    const char* response_data = response.c_str();
+    size_t response_len = response.length();
+    
+    while (total_sent < response_len) {
+        int sent = write(client_fd, response_data + total_sent, response_len - total_sent);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Socket buffer full, try again shortly
+                usleep(1000);
+                continue;
+            }
+            log_message(ERROR, "Error sending to client: " + std::string(strerror(errno)));
+            break;
+        }
+        total_sent += sent;
+    }
+}
+
+/**
+ * Checks for and handles incoming CLI client connections.
+ * Uses non-blocking accept() to process connection requests without
+ * blocking the main service loop.
+ */
+void check_cli_connections(int& cli_sockfd) {
+    // Set up client address structure
+    sockaddr_un client_addr = {};
+    socklen_t client_len = sizeof(client_addr);
+    
+    // Try to accept a new connection
+    int client_fd = accept(cli_sockfd, (sockaddr*)&client_addr, &client_len);
+
+    if (client_fd > 0) {
+        // Handle the client connection
+        handle_cli_client(client_fd);
+        close(client_fd);  // Close after handling
+    } else if (client_fd < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        log_message(ERROR, "Accept failed: " + std::string(strerror(errno)));
+        cli_error_count++; // Add counter here
+        if (cli_error_count >= 3) {
+            if(!recreate_socket(1, cli_sockfd)){ // 1 indicates CLI socket
+                shutdown_requested = 1;
+            };
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+// Resource Management
+//------------------------------------------------------------------------------
+
+/**
+ * Signal handler function for termination signals.
+ * Sets a global flag to indicate shutdown was requested.
+ */
+void handle_termination(int signal) {
+    // Set the flag to exit the main loop
+    shutdown_requested = 1;
+    
+    // Log which signal was received
+    std::string signal_name;
+    switch (signal) {
+        case SIGINT:  signal_name = "SIGINT"; break;
+        case SIGTERM: signal_name = "SIGTERM"; break;
+        case SIGHUP:  signal_name = "SIGHUP"; break;
+        default:      signal_name = "Unknown Signal (" + std::to_string(signal) + ")"; break;
+    }
+    
+    log_message(INFO, "Received " + signal_name + " signal, shutting down...");
+}
+
+/**
+ * Sets up signal handlers for common termination signals.
+ * This allows the program to perform cleanup when terminated.
+ */
+void setup_signal_handlers() {
+    // Register the same handler for multiple signals
+    struct sigaction sa = {};
+    sa.sa_handler = handle_termination;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    
+    // Register for common termination signals
+    sigaction(SIGINT, &sa, NULL);  // Ctrl+C
+    sigaction(SIGTERM, &sa, NULL); // kill command
+    sigaction(SIGHUP, &sa, NULL);  // Terminal closed
+    
+    log_message(INFO, "Signal handlers registered for graceful shutdown");
+}
+
+/**
+ * Performs cleanup tasks before program exit.
+ * Closes open sockets and removes the Unix socket file.
+ */
+void cleanup_resources(int service_sockfd, int cli_sockfd) {
+    // Close the sockets
+    if (service_sockfd >= 0) {
+        close(service_sockfd);
+    }
+    
+    if (cli_sockfd >= 0) {
+        close(cli_sockfd);
+    }
+    
+    // Remove the Unix socket file
+    unlink(SOCKET_PATH);
+    
+    log_message(INFO, "Resources cleaned up, service terminated");
+}
+
+//------------------------------------------------------------------------------
+// Main Function
+//------------------------------------------------------------------------------
+
+/**
  * Main program loop that periodically announces our service presence and
  * continuously listens for broadcasts from other services.
  */
 int main() {
-    // Set up the receiver socket
-    const int receiver_sockfd = setup_receiver_socket();
-    if (receiver_sockfd < 0) {
-        log_message(ERROR, "Failed to set up receiver socket, exiting");
-        return 1;
+    // Set up signal handlers
+    setup_signal_handlers();
+
+    // Set up the service socket
+    int service_sockfd = setup_udp_socket(BROADCAST_PORT);
+    if (service_sockfd < 0) {
+        if(!recreate_socket(0, service_sockfd)){ // 0 indicates UDP socket
+            return 1;
+        };
     }
-    log_message(INFO, "Receiver socket successfully initialized");
     
-    // Set up the broadcast socket
-    const int broadcast_sockfd = setup_broadcast_socket();
-    if (broadcast_sockfd < 0) {
-        log_message(ERROR, "Failed to set up broadcast socket, exiting");
-        close(receiver_sockfd);
-        return 1;
+
+    // Set up the service socket
+    int cli_sockfd = setup_cli_socket();
+    if (cli_sockfd < 0) {
+        if(!recreate_socket(1, cli_sockfd)){ // 1 indicates CLI socket
+            close(service_sockfd);
+            return 1;
+        };
     }
 
-    log_message(INFO, "Broadcast socket successfully initialized");
     log_message(INFO, "Initializing neighbor discovery service...");
     log_interfaces();
     log_message(INFO, "Neighbor discovery service successfully started");
@@ -556,14 +905,14 @@ int main() {
     time_t last_broadcast_time = 0;
     time_t last_cleanup_time = 0;
 
-    while (true) {
+    while (!shutdown_requested) {
         time_t current_time = time(NULL);
         
         // Check if it's time to broadcast our presence
         if (current_time - last_broadcast_time >= ANNOUNCE_INTERVAL) {
-            used_broadcasts.clear();
+            my_subnets.clear();
             my_local_ips.clear();
-            broadcast_service_presence(broadcast_sockfd);
+            broadcast_service_presence(service_sockfd);
             last_broadcast_time = current_time;
         }
 
@@ -574,14 +923,17 @@ int main() {
         }
         
         // Check for incoming broadcasts
-        receive_broadcasts(receiver_sockfd);
+        receive_messages(service_sockfd);
+
+        // Check for CLI client connections
+        check_cli_connections(cli_sockfd);
         
         // Sleep for a short time to avoid hogging CPU
         usleep(100000);  // 100ms
     }
-    
-    // Clean up sockets (this code will never be reached in this example)
-    close(receiver_sockfd);
-    close(broadcast_sockfd);
+
+    // Clean up resources when we exit the loop
+    cleanup_resources(service_sockfd, cli_sockfd);
+
     return 0;
 }
